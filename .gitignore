@@ -1,0 +1,39 @@
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Temporary & processing files
+.tmp/
+logs/
+processing_state.json
+jobs/
+
+# Data directories (large files, not for version control)
+pdfs/
+extracted_pages/
+verified_pages/
+completed_docs/
+chapter_sources/
+output_notes/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
