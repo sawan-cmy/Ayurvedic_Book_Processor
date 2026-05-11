@@ -80,11 +80,16 @@ PAGE_WORKERS_PER_JOB=1
 MAX_PARALLEL_JOBS=1
 CREATE_DOCX=true
 CREATE_STRUCTURED_NOTES=false
+FORCE_REPROCESS_PAGES=false
+USE_EMBEDDED_PDF_TEXT=true
+EXACT_TEXT_ONLY=false
 MAX_RETRIES=5
 GEMINI_TIMEOUT_SECONDS=180
 ```
 
 Keep parallelism conservative until Gemini quota and machine capacity are proven.
+Set `FORCE_REPROCESS_PAGES=true` when you need to overwrite old raw/verified page outputs after prompt changes or bad OCR results.
+Set `EXACT_TEXT_ONLY=true` when you only want real selectable PDF text copied from the file. In that mode scanned-image pages are marked failed instead of being converted with OCR.
 
 ## Start The Server
 

@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -23,33 +24,39 @@ from PIL import Image
 
 
 EXTRACTION_PROMPT = (
-    "You are reading a scanned Ayurvedic medical textbook page. Transcribe the visible text as accurately as possible. "
-    "Preserve Hindi, Sanskrit, English, headings, footnotes, tables, figure captions, page numbers, and medical terms. "
-    "Preserve the page's visible structure as much as possible, including section order, lists, table layout, and mixed-language formatting. "
-    "For printed tables, recreate the table as a Markdown table with the same columns, rows, row order, and cell text. "
-    "Do not merge table rows, do not omit repeated blank cells, and do not move text between columns. "
-    "When a printed table uses one merged category cell spanning several rows, repeat that category text in every Markdown row it applies to, for example Childhood repeated on each Childhood row. "
-    "When one table cell contains stacked lines, keep them inside the same Markdown cell using <br>, for example Kapha + + + <br> Pitta + + <br> Vayu +. "
-    "If a word is split only because of a line break inside a narrow table cell, join it into the normal word, for example deve-lopment -> development, preme-narche -> premenarche, establis-hed -> established, and reprod-uctive -> reproductive. "
-    "Keep hyphens that are truly part of the printed term, range, compound expression, or punctuation. "
-    "Do not add 'cont.', ellipses, summaries, explanations, or continuation notes unless they are visibly printed on the page. "
-    "Do not force this page into any fixed template. "
-    "Do not summarize. Do not translate unless translation is already printed on the page. If a word is unclear, "
-    "write [unclear]. Do not guess. Return only the transcription."
+    "You are reading a scanned Ayurvedic medical textbook page. Return an exact visible transcription only. "
+    "Treat the image as a collection of visual pixels, not as a language to be comprehended. Replicate the exact visible ink. "
+    "Copy the text exactly as printed from the image, including Hindi, Sanskrit, English, headings, footnotes, tables, figure captions, page numbers, punctuation, spelling, capitalization, numbers, symbols, and medical terms. "
+    "WARNING: The printed source text contains historical printing errors, misspelled Sanskrit, and grammatical typos (e.g., incorrect matras, wrong anusvaras, missing half-letters, like printing 'पुंष्यति' instead of 'पुष्यति' or 'लाहितादयः' instead of 'लोहितादयः'). YOU MUST PRESERVE THESE EXACT PRINTED ERRORS. "
+    "Preserve the visible reading order and line/table structure as closely as plain Markdown text allows. "
+    "For Sanskrit/Hindi shloka or quoted source verses, copy every Devanagari character exactly as visible, including matras, anusvara, visarga, half-letters, avagraha, punctuation, danda marks (। and ।।), reference text, and the same verse line breaks. "
+    "Pay extremely close attention to the presence or absence of the avagraha symbol ('ऽ'). Only include it if it is physically printed on the page. "
+    "Devanagari Matra Warning: Pay extreme attention to upper matras (e, ai, reph, anusvara). The ink may be blurry. Do not confuse the 'ऐ' (ai) matra for a 'र्' (reph). Do not insert an avagraha ('ऽ') unless there is a clear, definitive 'S' curve printed on the page. "
+    "Do NOT apply autocorrect. Do NOT fix Sanskrit grammar or spelling. If the printed book has a typo, your transcription MUST have the exact same typo. "
+    "Do not correct, modernize, complete, split, join, or reinterpret shloka text. "
+    "For printed tables, preserve the same columns, rows, row order, cell text, blank cells, and stacked cell lines; do not move text between columns. "
+    "Do not normalize spelling. Do not fix grammar. Do not expand abbreviations. Do not translate. Do not romanize. "
+    "Do not join split words, remove printed hyphens, add missing words, repeat merged-cell text, add labels, add continuation notes, or clean formatting unless that exact text is visibly printed. "
+    "If a character or word is unreadable from the image, write [unclear] in that exact position. "
+    "Do not guess from context or medical knowledge. Do not summarize. Return only the transcription."
 )
 
 VERIFICATION_PROMPT = (
-    "You are a strict medical textbook transcription verifier. Compare the extracted text against the scanned page image. "
-    "Correct only mistakes that are visible in the image. Do not add missing information from memory. Do not summarize. "
-    "Preserve Hindi, Sanskrit, English, headings, tables, footnotes, figure captions, and page order. "
-    "For printed tables, return a clean Markdown table with the same columns, rows, row order, and cell text visible in the image. "
-    "Fix OCR/table formatting errors such as misplaced cells, missing blank cells, broken Markdown pipes, and words split only by line wrapping inside table cells. "
-    "When a printed table uses one merged category cell spanning several rows, repeat that category text in every Markdown row it applies to, for example Childhood repeated on each Childhood row. "
-    "When one table cell contains stacked lines, keep them inside the same Markdown cell using <br>, for example Kapha + + + <br> Pitta + + <br> Vayu +. "
-    "Examples of line-wrap word fixes: deve-lopment -> development, preme-narche -> premenarche, establis-hed -> established, reprod-uctive -> reproductive. "
-    "Do not add 'cont.', ellipses, summaries, explanations, or continuation notes unless they are visibly printed on the page. "
-    "If text is unreadable, mark it as [unclear]. Preserve the original page's visible structure as much as possible. "
-    "Do not force this page into any fixed template. Return only the corrected verified transcription."
+    "You are a strict medical textbook transcription verifier. Compare the extracted text against the scanned page image and return an exact visible transcription only. "
+    "Treat the image as a collection of visual pixels, not as a language to be comprehended. Replicate the exact visible ink. "
+    "Correct only characters, words, punctuation, line/table placement, and omissions that are directly visible in the image; never correct the source text itself. "
+    "Preserve Hindi, Sanskrit, English, headings, tables, footnotes, figure captions, page numbers, spelling, capitalization, punctuation, numbers, symbols, and page order exactly as printed. "
+    "Pay extremely close attention to the presence or absence of the avagraha symbol ('ऽ'). Only include it if it is physically printed on the page. "
+    "Devanagari Matra Warning: Pay extreme attention to upper matras (e, ai, reph, anusvara). The ink may be blurry. Do not confuse the 'ऐ' (ai) matra for a 'र्' (reph). Do not insert an avagraha ('ऽ') unless there is a clear, definitive 'S' curve printed on the page. "
+    "Do NOT apply autocorrect. Do NOT fix Sanskrit grammar or spelling. If the printed book has a typo, your transcription MUST have the exact same typo. "
+    "WARNING: The printed source text contains historical printing errors, misspelled Sanskrit, and grammatical typos (e.g., incorrect matras, wrong anusvaras, missing half-letters, like printing 'पुंष्यति' instead of 'पुष्यति' or 'लाहितादयः' instead of 'लोहितादयः'). YOU MUST PRESERVE THESE EXACT PRINTED ERRORS. "
+    "For Sanskrit/Hindi shloka or quoted source verses, copy every Devanagari character exactly as visible, including matras, anusvara, visarga, half-letters, avagraha, punctuation, danda marks (। and ।।), reference text, and the same verse line breaks. "
+    "Do not correct, modernize, complete, split, join, or reinterpret shloka text. "
+    "For printed tables, preserve the same columns, rows, row order, cell text, blank cells, and stacked cell lines; do not move text between columns. "
+    "Do not normalize spelling. Do not fix grammar. Do not expand abbreviations. Do not translate. Do not romanize. "
+    "Do not join split words, remove printed hyphens, add missing words, repeat merged-cell text, add labels, add continuation notes, or clean formatting unless that exact text is visibly printed. "
+    "If a character or word is unreadable from the image, write [unclear] in that exact position. "
+    "Do not guess from context or medical knowledge. Do not summarize. Return only the verified transcription."
 )
 
 FORMAT_PROMPT = """You are converting verified Ayurvedic textbook transcription into structured study notes. Use only the verified source text. Do not invent anything. Do not add modern medical explanation unless it is present in the source. Preserve Ayurvedic terms. If a section is not clearly present, write: Not clearly mentioned in source text.
@@ -157,6 +164,9 @@ class Config:
     reset_master: bool
     create_docx: bool
     create_structured_notes: bool
+    force_reprocess_pages: bool
+    use_embedded_pdf_text: bool
+    exact_text_only: bool
     test_start_page: int
     test_max_pages: int
     test_pdf_limit: int
@@ -229,6 +239,9 @@ def load_config() -> Config:
         reset_master=parse_bool(os.getenv("RESET_MASTER"), default=False),
         create_docx=parse_bool(os.getenv("CREATE_DOCX"), default=False),
         create_structured_notes=parse_bool(os.getenv("CREATE_STRUCTURED_NOTES"), default=False),
+        force_reprocess_pages=parse_bool(os.getenv("FORCE_REPROCESS_PAGES"), default=False),
+        use_embedded_pdf_text=parse_bool(os.getenv("USE_EMBEDDED_PDF_TEXT"), default=True),
+        exact_text_only=parse_bool(os.getenv("EXACT_TEXT_ONLY"), default=False),
         test_start_page=parse_int(os.getenv("TEST_START_PAGE"), 1, minimum=1),
         test_max_pages=parse_int(os.getenv("TEST_MAX_PAGES"), 0, minimum=0),
         test_pdf_limit=parse_int(os.getenv("TEST_PDF_LIMIT"), 0, minimum=0),
@@ -391,6 +404,53 @@ def convert_pdf_page_to_image(pdf_path: Path, config: Config, page_number: int) 
         raise RuntimeError(f"PDF page conversion failed for {pdf_path.name} page {page_number}: {exc}") from exc
 
 
+def pdftotext_exe(config: Config) -> str:
+    if config.poppler_path:
+        candidate = Path(config.poppler_path) / "pdftotext.exe"
+        if candidate.exists():
+            return str(candidate)
+    return "pdftotext"
+
+
+def extract_embedded_pdf_page_text(pdf_path: Path, config: Config, page_number: int) -> str:
+    temp_dir = config.root_dir / ".tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    output_path = temp_dir / f"{pdf_path.stem}_page_{page_number:03d}_pdftotext.txt"
+    command = [
+        pdftotext_exe(config),
+        "-f",
+        str(page_number),
+        "-l",
+        str(page_number),
+        "-layout",
+        "-enc",
+        "UTF-8",
+        str(pdf_path),
+        str(output_path),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+    except FileNotFoundError:
+        logging.warning("pdftotext is not available, falling back to OCR for %s page %03d.", pdf_path.name, page_number)
+        return ""
+    except subprocess.TimeoutExpired:
+        logging.warning("pdftotext timed out for %s page %03d.", pdf_path.name, page_number)
+        return ""
+
+    if completed.returncode != 0:
+        logging.warning(
+            "pdftotext failed for %s page %03d: %s",
+            pdf_path.name,
+            page_number,
+            completed.stderr.strip(),
+        )
+        return ""
+    if not output_path.exists():
+        return ""
+    text = output_path.read_text(encoding="utf-8", errors="replace")
+    return text.replace("\f", "").rstrip()
+
+
 def pil_image_to_bytes(image: Image.Image) -> bytes:
     buffer = io.BytesIO()
     if image.mode not in {"RGB", "L"}:
@@ -455,7 +515,14 @@ def call_gemini_with_retry(
         if config.gemini_delay_seconds:
             time.sleep(config.gemini_delay_seconds)
         try:
-            response = client.models.generate_content(model=config.gemini_model, contents=contents)
+            response = client.models.generate_content(
+                model=config.gemini_model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    top_p=0.1,
+                ),
+            )
             text = response_text(response)
             if not text:
                 raise RuntimeError("Empty Gemini response")
@@ -841,7 +908,11 @@ def process_pdf(client: genai.Client, config: Config, state: dict[str, Any], pdf
         verified_path = page_file(verified_pdf_dir, index, "verified")
         raw_path = page_file(raw_pdf_dir, index, "raw")
 
-        if verified_path.exists() and index in set(int_list(state, "verified_pages", pdf_stem)):
+        if (
+            not config.force_reprocess_pages
+            and verified_path.exists()
+            and index in set(int_list(state, "verified_pages", pdf_stem))
+        ):
             logging.info("Skipping already verified page: %s page %03d", pdf_stem, index)
             return
 
@@ -850,8 +921,26 @@ def process_pdf(client: genai.Client, config: Config, state: dict[str, Any], pdf
 
         try:
             page_client = gemini_client(config)
+            embedded_text = ""
+            if config.use_embedded_pdf_text:
+                embedded_text = extract_embedded_pdf_page_text(pdf_path, config, index)
+
+            if embedded_text.strip():
+                raw_path.write_text(embedded_text.strip() + "\n", encoding="utf-8")
+                verified_path.write_text(embedded_text.strip() + "\n", encoding="utf-8")
+                with state_lock:
+                    mark_page_extracted(config, state, pdf_stem, index)
+                    mark_page_verified(config, state, pdf_stem, index)
+                logging.info("Used embedded PDF text without OCR: %s page %03d", pdf_stem, index)
+                return
+
+            if config.exact_text_only:
+                raise RuntimeError(
+                    "No embedded PDF text found on this page. Exact text-only mode will not create OCR text from scanned pixels."
+                )
+
             image = convert_pdf_page_to_image(pdf_path, config, index)
-            if raw_path.exists():
+            if raw_path.exists() and not config.force_reprocess_pages:
                 extracted_text = raw_path.read_text(encoding="utf-8")
                 with state_lock:
                     mark_page_extracted(config, state, pdf_stem, index)
