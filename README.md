@@ -52,8 +52,6 @@ skipped, and only missing pages/final output steps are retried.
 | `.env` | Real production settings and secrets. Do not share publicly. |
 | `.env.example` | Safe configuration template without real secrets. |
 | `PRODUCTION_RUNBOOK.md` | Operational checklist and production rules. |
-| `CODE_EXPLANATION_FOR_COWORKERS.docx` | Line-by-line code explanation for coworkers. |
-| `CODE_EXPLANATION_FOR_COWORKERS.pdf` | PDF version of the line-by-line explanation. |
 
 ## Important Folders
 
@@ -75,21 +73,32 @@ Recommended `.env` values for tomorrow's production run:
 ```text
 TEST_MAX_PAGES=0
 TEST_PDF_LIMIT=1
-SPEED_MODE=accuracy
-PAGE_WORKERS_PER_JOB=1
-MAX_PARALLEL_JOBS=1
+SPEED_MODE=fast
+PAGE_WORKERS_PER_JOB=2
+MAX_PARALLEL_JOBS=2
 CREATE_DOCX=true
 CREATE_STRUCTURED_NOTES=false
 FORCE_REPROCESS_PAGES=false
 USE_EMBEDDED_PDF_TEXT=true
 EXACT_TEXT_ONLY=false
-MAX_RETRIES=5
+MAX_RETRIES=4
 GEMINI_TIMEOUT_SECONDS=180
+GEMINI_DELAY_SECONDS=0
+PROMPT_ENGINE_BATCH_SIZE=4
 ```
 
 Keep parallelism conservative until Gemini quota and machine capacity are proven.
+If the paid quota handles this without `429` or timeout errors, test either
+`MAX_PARALLEL_JOBS=3` or `PAGE_WORKERS_PER_JOB=3`.
 Set `FORCE_REPROCESS_PAGES=true` when you need to overwrite old raw/verified page outputs after prompt changes or bad OCR results.
 Set `EXACT_TEXT_ONLY=true` when you only want real selectable PDF text copied from the file. In that mode scanned-image pages are marked failed instead of being converted with OCR.
+
+For 25-person use, run the web server and worker separately:
+
+```powershell
+.\start_web.ps1
+.\start_worker.ps1
+```
 
 ## Start The Server
 
@@ -219,16 +228,10 @@ Check:
 - Keep this on a trusted private network.
 - Do not expose directly to the public internet.
 
-## Documentation For Coworkers
-
-Line-by-line explanation documents:
-
-- `CODE_EXPLANATION_FOR_COWORKERS.docx`
-- `CODE_EXPLANATION_FOR_COWORKERS.pdf`
-
-Operational checklist:
+## Operations Documentation
 
 - `PRODUCTION_RUNBOOK.md`
+
 
 ## One-Sentence Summary
 

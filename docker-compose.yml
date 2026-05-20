@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  ayurveda-processor:
+    build: .
+    container_name: ayurveda-processor
+    restart: always
+    ports:
+      - "7860:7860"
+    environment:
+      - MAX_PARALLEL_JOBS=25
+      - PAGE_WORKERS_PER_JOB=2
+      - SPEED_MODE=balanced
+    env_file:
+      - .env
+    volumes:
+      - ./pdfs:/app/pdfs
+      - ./output_notes:/app/output_notes
+      - ./completed_docs:/app/completed_docs
+      - ./slide_deck_outputs:/app/slide_deck_outputs
+      - ./jobs:/app/jobs
+      - ./logs:/app/logs
+      - ./processing_state.json:/app/processing_state.json

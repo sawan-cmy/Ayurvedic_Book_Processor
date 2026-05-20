@@ -25,6 +25,9 @@ verified_pages/
 completed_docs/
 chapter_sources/
 output_notes/
+image_slide_deck_outputs/
+slide_deck_outputs/
+CODE_EXPLANATION_FOR_COWORKERS.*
 
 # IDE / Editor
 .vscode/
