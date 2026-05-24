@@ -1,257 +1,190 @@
-# Ayurvedic Book Processor
+# 🌿 Ayurvedic Book Processor
 
-Private production tool for converting scanned Ayurvedic textbook PDFs into
-verified Word documents using Gemini multimodal transcription and verification.
+> **Production-grade transcription, translation, and verification pipeline** designed to convert scanned Ayurvedic textbook PDFs (Sanskrit & Hindi Devanagari script) into formatted Word documents (`.docx`) and AI-illustrated slide decks (`.pptx`/`.pdf`).
 
-The system is designed for a small trusted internal team. Users upload PDFs in a
-browser, the app processes them as background jobs, saves progress page by page,
-and publishes completed `.docx` files for download.
+Developed for small internal teams of up to 100 users on a private network, using high-accuracy Gemini Multimodal and Imagen AI models.
 
-## Current Production Status
+---
 
-Ready for internal production use on a trusted laptop/server and private network.
-
-Not intended for public internet exposure without HTTPS, stronger authentication,
-monitoring, backups, and a database-backed job queue.
-
-## Key Features
-
-- Browser-based PDF upload and job queue.
-- Basic username/password login.
-- Full-PDF processing mode for production.
-- Gemini extraction plus verification for higher transcription accuracy.
-- Page-by-page progress saving.
-- Resume support for failed long jobs.
-- Final Word documents copied to `completed_docs`.
-- Waitress-based production server startup.
-- Upload-size limit and safer production response headers.
-
-## How Processing Works
-
-For every uploaded PDF:
-
-1. The app creates a job folder under `jobs`.
-2. The processor reads the PDF's actual page count.
-3. Each page is converted to an image.
-4. Gemini extracts the visible text.
-5. Gemini verifies the extracted text against the image.
-6. Verified page text is saved immediately.
-7. After all pages are verified, the app creates a `.docx`.
-8. Final Word files are copied to `completed_docs`.
-
-If processing fails, click `Run Again / Resume`. Already verified pages are
-skipped, and only missing pages/final output steps are retried.
-
-## Important Files
-
-| Path | Purpose |
-|---|---|
-| `app.py` | Flask web app, upload UI, auth, job queue, downloads, background runner. |
-| `ultimate_book_processor.py` | PDF conversion, Gemini calls, page verification, DOCX generation. |
-| `start_production.ps1` | Starts the production Waitress server. |
-| `.env` | Real production settings and secrets. Do not share publicly. |
-| `.env.example` | Safe configuration template without real secrets. |
-| `PRODUCTION_RUNBOOK.md` | Operational checklist and production rules. |
-
-## Important Folders
-
-| Folder | Purpose |
-|---|---|
-| `jobs` | Per-upload job folders, logs, state, resumable page output. |
-| `completed_docs` | Final Word documents ready for staff to download/use. |
-| `logs` | Project-level logs. Job-specific logs are under each job folder. |
-| `pdfs` | Root script input folder; web uploads use per-job `pdfs` folders. |
-| `output_notes` | Root script output folder; web jobs use per-job `output_notes`. |
-| `extracted_pages` | Raw page transcription storage. |
-| `verified_pages` | Verified page transcription storage used for resume. |
-| `chapter_sources` | Combined verified page text before DOCX output. |
-
-## Production Configuration
-
-Recommended `.env` values for tomorrow's production run:
+## 📂 Project Structure Map
 
 ```text
-TEST_MAX_PAGES=0
-TEST_PDF_LIMIT=1
-SPEED_MODE=fast
-PAGE_WORKERS_PER_JOB=2
-MAX_PARALLEL_JOBS=2
-CREATE_DOCX=true
-CREATE_STRUCTURED_NOTES=false
-FORCE_REPROCESS_PAGES=false
-USE_EMBEDDED_PDF_TEXT=true
-EXACT_TEXT_ONLY=false
-MAX_RETRIES=4
-GEMINI_TIMEOUT_SECONDS=180
-GEMINI_DELAY_SECONDS=0
-PROMPT_ENGINE_BATCH_SIZE=4
+Ayurvedic_Book_Processor/
+├── .dockerignore           # Excludes local files/secrets from Docker build context
+├── .env.example            # Configuration template without real secrets
+├── .gitignore              # Git ignored files and directories
+├── AGENTS.md               # Strict guidelines and architecture rules for AI agents
+├── Dockerfile              # Container spec (runs as non-root user, optimized cache)
+├── docker-compose.yml      # Orchestrates Web and Worker containers
+├── pytest.ini              # Pytest environment configuration
+├── requirements.txt        # Production Python dependencies
+│
+├── app.py                  # Flask Web App (UI, Auth, CSRF, Jobs API, Web server)
+├── worker.py               # Background job dispatcher loop
+├── utils.py                # Shared helpers (network, validation, environment checks)
+│
+├── ultimate_book_processor.py # Core PDF pipeline: OCR, Gemini verify, DOCX compilation
+├── batch_prompt_planner.py    # Planner helper for batch Gemini prompts
+│
+├── image_deck_generator.py # Orchestrates slide deck planning & asset compilation
+├── image_deck_renderer.py  # Render PIL/Devanagari text layouts and queries Imagen AI
+├── image_deck_exporter.py  # Formats slide deck exports to PDFs, ZIPs, and report stats
+├── image_deck_prompts.py   # Production-tuned Gemini and Imagen prompt prompts
+│
+├── production_check.py     # Pre-flight system check for safety & environment validation
+│
+├── tests/                  # Test suite directory
+│   └── test_app_safety.py  # Suite for auth bypass, multi-tenancy, and CSRF tests
+│
+└── [Runtime Directories] (Auto-generated & Git ignored)
+    ├── jobs/               # Contains local status, log streams, and intermediate state files
+    ├── completed_docs/     # Final .docx files copied here for download
+    ├── logs/               # Global logs directory
+    └── slide_deck_outputs/ # Rendered slide decks
 ```
 
-Keep parallelism conservative until Gemini quota and machine capacity are proven.
-If the paid quota handles this without `429` or timeout errors, test either
-`MAX_PARALLEL_JOBS=3` or `PAGE_WORKERS_PER_JOB=3`.
-Set `FORCE_REPROCESS_PAGES=true` when you need to overwrite old raw/verified page outputs after prompt changes or bad OCR results.
-Set `EXACT_TEXT_ONLY=true` when you only want real selectable PDF text copied from the file. In that mode scanned-image pages are marked failed instead of being converted with OCR.
+---
 
-For 25-person use, run the web server and worker separately:
+## 🛠 Technology Stack
 
-```powershell
-.\start_web.ps1
-.\start_worker.ps1
+* **Core Backend:** Python 3.11, Flask, Waitress (WSGI server)
+* **AI Engine:** Google Gemini API (paid tier, `gemini-2.5-flash` / `gemini-2.5-pro`), Imagen AI
+* **Document Compilation:** `python-docx`
+* **PDF Processing:** `pdf2image` (backed by Poppler CLI)
+* **Graphics Rendering:** PIL (Pillow) with custom Devanagari font rendering
+* **Database & Queue:** SQLite (WAL mode enabled)
+* **Authentication:** Per-user authentication with `bcrypt` password hashing
+* **Deployment:** Docker, Docker Compose, Windows PowerShell execution wrappers
+
+---
+
+## 🔄 Architecture & Jobs Flow
+
+The system runs asynchronously using a sqlite-based queue to ensure reliability and resumability:
+
+```mermaid
+graph TD
+    User([User Web Interface]) -->|1. Upload PDF| Flask[app.py Web App]
+    Flask -->|2. Create Job| SQLite[(SQLite jobs.db)]
+    SQLite -.->|3. Queue Poll| Worker[worker.py Loop]
+    Worker -->|4. Execute Subprocess| Processor[ultimate_book_processor.py]
+    Processor -->|5. Convert Page-by-Page| Poppler[pdf2image / Poppler]
+    Processor -->|6. Multimodal OCR| Gemini[Gemini 2.5 Pro]
+    Processor -->|7. Cross-Verify Text| Gemini
+    Processor -->|8. Generate Word Document| Docx[python-docx]
+    Docx -->|9. Copy Output| Completed[completed_docs/]
+    Completed -.->|10. Download| User
 ```
 
-## Start The Server
+### 1. Job Life Cycle
+1. **Upload:** User uploads a PDF. A secure unique job ID is generated.
+2. **Database Registration:** The job is added to the SQLite queue database with `status="queued"`.
+3. **Dispatcher Selection:** The `worker.py` daemon picks up the job when a slot is free.
+4. **Execution:** The worker spawns `ultimate_book_processor.py` to extract page images, invoke Gemini for OCR transcriptions, verify accuracy, and build the target Word document.
+5. **Output Delivery:** Completed files are copied to the `completed_docs/` folder, and the database status updates to `completed`.
 
-Run PowerShell:
+---
 
-```powershell
-cd "C:\Users\sawan\Desktop\new_project\Ayurvedic_Book_Processor"
-.\start_production.ps1
-```
+## 🔒 Security Hardening (Current V1 Pass)
 
-Open locally:
+The application has been hardened to prevent common vulnerabilities during private network operations:
 
-```text
-http://127.0.0.1:7860
-```
+1. **Authentication:** Per-user password verification backed by `bcrypt`. Dev bypass is disabled unless `ALLOW_AUTH_BYPASS=true` is set.
+2. **CSRF Protection:** Secure CSRF tokens are injected into all web forms and validated on all state-modifying requests (`POST`).
+3. **Multi-Tenancy Isolation:** Strict database and route checks ensure that normal (non-admin) users can only view, download, modify, or delete their own jobs.
+4. **Path Traversal Mitigation:** Manual correction pathways verify that page files stay strictly within the verified bounds of the job directory.
+5. **Resource Limits:** Capped concurrent Server-Sent Events (SSE) connections to prevent Waitress thread starvation under load.
+6. **Docker Non-Root Execution:** Containers run as `appuser` and exclude local secret files via `.dockerignore`.
 
-For users on the same private network:
+---
 
-```text
-http://YOUR-LAPTOP-IP:7860
-```
+## 🚀 Getting Started
 
-If Windows Firewall prompts, allow Python/Waitress on private networks.
+### Prerequisites
+* Python 3.11 installed.
+* Poppler installed and added to the PATH (required for PDF-to-image conversion).
+* Gemini API Key (paid tier recommended).
 
-## Staff Workflow
+### Local Setup
+1. Clone the repository and navigate to the directory:
+   ```powershell
+   cd "C:\Users\sawan\Desktop\new_project\Ayurvedic_Book_Processor"
+   ```
+2. Create and activate a virtual environment:
+   ```powershell
+   python -m venv .venv
+   .venv\Scripts\Activate.ps1
+   ```
+3. Install dependencies:
+   ```powershell
+   pip install -r requirements.txt
+   ```
+4. Copy configuration template and fill in your keys:
+   ```powershell
+   copy .env.example .env
+   ```
 
-1. Open the app URL.
-2. Log in with the shared internal credentials.
-3. Upload PDF files.
-4. Wait for the job to complete.
-5. Download final Word files from `Completed Word Documents`.
-6. If a job fails, click `Run Again / Resume`.
+---
 
-Staff should not change processing settings unless the operator approves it.
+## 🎮 Running the Application
 
-## Resume Behavior
-
-Resume is not tied to any fixed page count. Each PDF uses its own actual page
-count.
-
-Example:
-
-- A 73-page book fails on page 70.
-- Pages 1-69 are already verified and saved.
-- Click `Run Again / Resume`.
-- The processor skips pages 1-69 and retries missing pages.
-
-This prevents wasting Gemini calls on pages that already finished.
-
-## Monitoring
-
-During production, watch:
-
-- job status in the web UI,
-- `Recent Log` in the web UI,
-- files appearing in `completed_docs`,
-- Gemini quota/cost dashboard,
-- laptop/server power and internet stability.
-
-Useful job logs:
-
-```text
-jobs/<job_id>/logs/interface_run.log
-jobs/<job_id>/logs/processor.log
-```
-
-Run a fast local preflight before staff start uploading:
-
-```powershell
-.\.venv\Scripts\python.exe production_check.py
-```
-
-The web UI also shows production warnings for missing login, missing Gemini key,
-page-limit mode, low disk, invalid Poppler path, or risky parallelism.
-
-Per-job `.env` files contain only non-secret processor settings. `GEMINI_API_KEY`
-is passed to the processor process at runtime so it is not copied into every job
-folder.
-
-For local production/demo use, run one web process on one machine. The queue uses
-local SQLite plus local folders, so multiple web workers or multiple servers can
-process the same queue inconsistently.
-
-## Backup
-
-Back up these regularly:
-
-```text
-completed_docs
-jobs
-logs
-.env
-```
-
-`jobs` is important because it contains resumable progress.
-
-`.env` contains the paid API key, so store it securely.
-
-## Troubleshooting
-
-### Job Failed
-
-Read the failure reason in the UI and click `Run Again / Resume`.
-
-### No Word File Appears
-
-Check:
-
-```text
-jobs/<job_id>/logs/processor.log
-```
-
-The most common reasons are PDF conversion errors, Gemini timeouts, or failed
-pages that need a resume.
-
-### App Does Not Open
-
-Restart the server with:
-
+### 1. Single Server Mode (Local/Development)
+Starts both the Flask Waitress server and the background worker together:
 ```powershell
 .\start_production.ps1
 ```
 
-Then check:
+### 2. Multi-Process Mode (Recommended for 25+ Concurrent Users)
+Run the web application front-end and worker dispatchers as separate processes:
+* **Web Server:**
+  ```powershell
+  .\start_web.ps1
+  ```
+* **Background Worker:**
+  ```powershell
+  .\start_worker.ps1
+  ```
 
-```text
-http://127.0.0.1:7860/health
+### 3. Docker Deployment
+Deploy via Docker Compose:
+```bash
+docker-compose up --build
+```
+*Port mapping defaults to `7860` in Waitress.*
+
+---
+
+## ⚙️ Environment Variables Checklist
+
+Key settings defined in `.env`:
+
+| Key | Default | Description |
+|---|---|---|
+| `GEMINI_API_KEY` | *(Secret)* | Gemini API credential (paid tier). |
+| `ALLOW_AUTH_BYPASS` | `false` | Set to `true` to skip login locally (Dev mode). |
+| `TEST_MAX_PAGES` | `0` | Hard cap on pages processed per job (0 = disable cap). |
+| `PAGE_WORKERS_PER_JOB`| `2` | Parallel thread workers executing Gemini calls per PDF. |
+| `MAX_PARALLEL_JOBS` | `2` | Maximum concurrent jobs dispatched by the worker. |
+| `MAX_UPLOAD_MB` | `250` | Maximum allowed size of uploaded PDF file. |
+
+---
+
+## 🧪 Testing
+
+Run automated tests to verify safety boundaries:
+```powershell
+pytest tests/ -v
 ```
 
-### Other Users Cannot Connect
+Tests cover:
+* HTTP authentication fail-closed logic.
+* CSRF token enforcement on actions (Upload, Delete, Settings).
+* User data-boundary limits (preventing access to other users' jobs).
 
-Check:
+---
 
-- same private network,
-- correct laptop IP address,
-- Windows Firewall allowed private network access,
-- server is running on `HOST=0.0.0.0`.
-
-## Security Notes
-
-- Do not share `.env`.
-- Do not share the Gemini API key.
-- Use a strong `APP_PASSWORD`.
-- Keep this on a trusted private network.
-- Do not expose directly to the public internet.
-
-## Operations Documentation
-
-- `PRODUCTION_RUNBOOK.md`
-
-
-## One-Sentence Summary
-
-This is a private PDF-to-Word processing queue that uses Gemini to transcribe and
-verify scanned Ayurvedic book pages, saves every page as it goes, and resumes
-failed jobs without starting over.
+## 📑 Operations Documentation
+* Check the [PRODUCTION_RUNBOOK.md](file:///c:/Users/sawan/Desktop/new_project/Ayurvedic_Book_Processor/PRODUCTION_RUNBOOK.md) for pre-flight commands, updates, and troubleshooting.
+* Verify the security features using [SECURITY_REVIEW_AND_FIXES.md](file:///c:/Users/sawan/Desktop/new_project/Ayurvedic_Book_Processor/SECURITY_REVIEW_AND_FIXES.md).
+* Review upcoming features and optimizations in the [POST_DEMO_ROADMAP.md](file:///c:/Users/sawan/Desktop/new_project/Ayurvedic_Book_Processor/POST_DEMO_ROADMAP.md).
+* Reference the [EDGE_CASES_CHECKLIST.md](file:///c:/Users/sawan/Desktop/new_project/Ayurvedic_Book_Processor/EDGE_CASES_CHECKLIST.md) to smoke-test edge cases before live demos.
