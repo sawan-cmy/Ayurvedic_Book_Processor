@@ -89,6 +89,14 @@ Open locally:
 http://127.0.0.1:7860
 ```
 
+Before starting staff work, run the local preflight:
+
+```powershell
+.\.venv\Scripts\python.exe production_check.py
+```
+
+Fix any warnings before uploading production PDFs.
+
 Other people on the same network should open:
 
 ```text
@@ -111,6 +119,12 @@ Find your IP with `ipconfig` (Windows) or `ifconfig` (Linux/Mac).
 - If a job fails, read the failure reason shown under the job row and the Recent Log.
 - Completed Word files are copied to `completed_docs`.
 - Upload the `.docx` to Google Drive, then open with Google Docs.
+- If you change the Gemini key in `.env`, click `Run Again / Resume`; retried
+  jobs refresh their copied job `.env` before running.
+- The Gemini key is passed to the processor at runtime and is not written into
+  new per-job `.env` files.
+- For the live demo, run one web process on one machine. Do not start multiple
+  web workers against the same local `jobs/jobs.db`.
 
 ## 4. Backup Folders
 
@@ -130,7 +144,8 @@ Also back up `.env` securely because it contains the API key.
 - No per-user accounts.
 - No automatic Google Docs upload.
 - No HTTPS unless you put it behind a reverse proxy or private tunnel.
-- No database server; jobs are stored in `jobs/jobs.json`.
+- No database server; jobs are stored in local SQLite at `jobs/jobs.db`.
+- No multi-server or multi-web-worker queue coordination.
 
 For a larger rollout, move this to a real server with HTTPS, backups, monitoring,
 and a proper database-backed job queue.

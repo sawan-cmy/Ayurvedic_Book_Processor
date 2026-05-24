@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import hashlib
+import hmac
 import os
 import re
 import shutil
@@ -37,15 +39,65 @@ PROCESSOR = ROOT / "ultimate_book_processor.py"
 JOBS_DB = JOBS_DIR / "jobs.db"
 JOBS_LOCK_FILE = JOBS_DIR / "jobs.db.lock"
 JOB_ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-fA-F]{8}$")
+COMPLETED_DOC_JOB_RE = re.compile(r"^(?P<job_id>\d{8}_\d{6}_[0-9a-fA-F]{8})_")
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{2,64}$")
 MAX_QUEUED_PER_USER = 3
 MIN_FREE_DISK_MB = 1024
+MAX_FAILED_LOGINS = 8
+LOGIN_WINDOW_SECONDS = 300
+MAX_SSE_CONNECTIONS = 20
+PROCESSOR_ENV_KEYS = [
+    "GEMINI_MODEL",
+    "GEMINI_EXTRACTION_MODEL",
+    "GEMINI_VERIFICATION_MODEL",
+    "GEMINI_FORMAT_MODEL",
+    "PDF_DIR",
+    "OUTPUT_DIR",
+    "POPPLER_PATH",
+    "DPI",
+    "MAX_RETRIES",
+    "GEMINI_DELAY_SECONDS",
+    "GEMINI_TIMEOUT_SECONDS",
+    "SPEED_MODE",
+    "PAGE_WORKERS_PER_JOB",
+    "RESET_MASTER",
+    "CREATE_DOCX",
+    "TEST_START_PAGE",
+    "TEST_MAX_PAGES",
+    "TEST_PDF_LIMIT",
+    "CREATE_STRUCTURED_NOTES",
+    "FORCE_REPROCESS_PAGES",
+    "USE_EMBEDDED_PDF_TEXT",
+    "EXACT_TEXT_ONLY",
+    "CLEAR_PROXY_ENV",
+]
+PROCESSOR_SECRET_ENV_KEYS = [
+    "GEMINI_API_KEY",
+]
+WEB_ONLY_ENV_KEYS = [
+    "APP_USERNAME",
+    "APP_PASSWORD",
+]
+PRODUCTION_WARNING_CACHE_SECONDS = 30
 
 logger = logging.getLogger(__name__)
 
 load_dotenv(ENV_FILE)
 
+
+def parse_int_value(value: Any, default: int, minimum: int, maximum: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "250")) * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = parse_int_value(os.getenv("MAX_UPLOAD_MB"), 250, 1, 2048) * 1024 * 1024
 
 jobs_lock = threading.RLock()
 dispatcher_lock = threading.Lock()
@@ -56,6 +108,12 @@ running_processes: dict[str, subprocess.Popen[str]] = {}
 running_job_ids: set[str] = set()
 running_deck_generations: set[str] = set()
 dispatcher_started = False
+production_warnings_lock = threading.Lock()
+production_warnings_cache: dict[str, Any] = {"expires_at": 0.0, "signature": None, "warnings": []}
+failed_login_lock = threading.Lock()
+failed_login_attempts: dict[str, list[float]] = {}
+sse_lock = threading.Lock()
+sse_connections = 0
 
 if os.name == "nt":
     import msvcrt
@@ -77,7 +135,15 @@ def jobs_file_lock() -> Any:
 
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     with jobs_file_lock_guard:
-        with JOBS_LOCK_FILE.open("a+b") as handle:
+        try:
+            handle_cm = JOBS_LOCK_FILE.open("a+b")
+        except PermissionError:
+            fallback_lock = ROOT / ".tmp" / "jobs.db.lock"
+            fallback_lock.parent.mkdir(parents=True, exist_ok=True)
+            handle_cm = fallback_lock.open("a+b")
+            logger.warning("Could not use %s; using fallback lock %s", JOBS_LOCK_FILE, fallback_lock)
+
+        with handle_cm as handle:
             locked = False
             try:
                 if os.name == "nt":
@@ -195,7 +261,7 @@ def render_slide_deck_panel(job_id: str, job_status: str) -> str:
     state = load_slide_deck_state(job_id)
     deck_status = state.get("status", "not_started")
     if deck_status == "not_started":
-        action = f"<form action='{url_for('generate_image_slide_deck_route', job_id=job_id)}' method='post' class='inline' style='margin:0;'><button class='secondary'>Generate Image Slide Deck</button></form>"
+        action = f"<form action='{url_for('generate_image_slide_deck_route', job_id=job_id)}' method='post' class='inline' style='margin:0;'>{csrf_input()}<button class='secondary'>Generate Image Slide Deck</button></form>"
         return f"<div class='deckbox'><strong>Slide Deck:</strong> Not started {action}</div>"
     
     html = [f"<div class='deckbox'><strong>Slide Deck:</strong> {deck_status.replace('_', ' ').title()}"]
@@ -207,7 +273,7 @@ def render_slide_deck_panel(job_id: str, job_status: str) -> str:
     elif deck_status == "failed":
         err = state.get("latest_error", "Unknown error")
         html.append(f"<small class='problem'>{escape(err)}</small>")
-        html.append(f"<form action='{url_for('generate_image_slide_deck_route', job_id=job_id)}' method='post' class='inline' style='margin-top:6px;'><button class='secondary'>Retry Generation</button></form>")
+        html.append(f"<form action='{url_for('generate_image_slide_deck_route', job_id=job_id)}' method='post' class='inline' style='margin-top:6px;'>{csrf_input()}<button class='secondary'>Retry Generation</button></form>")
     elif deck_status == "completed":
         zip_path = slide_deck_zip_file(job_id)
         if zip_path.exists():
@@ -333,6 +399,10 @@ def write_env(updates: dict[str, str]) -> None:
         "TEST_MAX_PAGES",
         "TEST_PDF_LIMIT",
         "CREATE_STRUCTURED_NOTES",
+        "FORCE_REPROCESS_PAGES",
+        "USE_EMBEDDED_PDF_TEXT",
+        "EXACT_TEXT_ONLY",
+        "CLEAR_PROXY_ENV",
         "MAX_PARALLEL_JOBS",
         "DISABLE_INLINE_WORKERS",
         "PROMPT_ENGINE_BATCH_SIZE",
@@ -343,6 +413,7 @@ def write_env(updates: dict[str, str]) -> None:
         "MAX_UPLOAD_MB",
         "APP_USERNAME",
         "APP_PASSWORD",
+        "APP_CSRF_SECRET",
     ]
     lines: list[str] = []
     for key in ordered_keys:
@@ -353,7 +424,47 @@ def write_env(updates: dict[str, str]) -> None:
     ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
     load_dotenv(ENV_FILE, override=True)
     upload_mb = existing.get("MAX_UPLOAD_MB", os.getenv("MAX_UPLOAD_MB", "250"))
-    app.config["MAX_CONTENT_LENGTH"] = int(upload_mb) * 1024 * 1024
+    app.config["MAX_CONTENT_LENGTH"] = parse_int_value(upload_mb, 250, 1, 2048) * 1024 * 1024
+
+
+def build_job_env(root_env: dict[str, str]) -> dict[str, str]:
+    job_env = {key: str(root_env[key]) for key in PROCESSOR_ENV_KEYS if key in root_env}
+    job_env.update(
+        {
+            "PDF_DIR": "./pdfs",
+            "OUTPUT_DIR": "./output_notes",
+            "CREATE_DOCX": "true",
+            "RESET_MASTER": "false",
+            "TEST_START_PAGE": root_env.get("TEST_START_PAGE", "1"),
+            "TEST_MAX_PAGES": root_env.get("TEST_MAX_PAGES", "0"),
+            "TEST_PDF_LIMIT": "1",
+            "CREATE_STRUCTURED_NOTES": root_env.get("CREATE_STRUCTURED_NOTES", "false"),
+            "SPEED_MODE": root_env.get("SPEED_MODE", "balanced"),
+            "PAGE_WORKERS_PER_JOB": root_env.get("PAGE_WORKERS_PER_JOB", "2"),
+        }
+    )
+    return job_env
+
+
+def build_processor_runtime_env(root_env: dict[str, str]) -> dict[str, str]:
+    return {key: str(root_env[key]) for key in PROCESSOR_SECRET_ENV_KEYS if root_env.get(key)}
+
+
+def write_job_env(folder: Path, job_env: dict[str, str]) -> None:
+    ordered = [key for key in PROCESSOR_ENV_KEYS if key in job_env]
+    ordered.extend(sorted(set(job_env) - set(ordered)))
+    env_lines = [f"{key}={job_env[key]}" for key in ordered]
+    (folder / ".env").write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+
+
+def refresh_job_env(job_id: str, root_env: dict[str, str] | None = None) -> bool:
+    if not valid_job_id(job_id):
+        return False
+    folder = job_dir(job_id)
+    if not folder.exists():
+        return False
+    write_job_env(folder, build_job_env(root_env or read_env()))
+    return True
 
 
 def max_parallel_jobs() -> int:
@@ -369,11 +480,137 @@ def inline_workers_enabled() -> bool:
     return value.strip().lower() not in {"1", "true", "yes", "on"}
 
 
+def truthy_env(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def csrf_secret() -> str:
+    secret = os.getenv("APP_CSRF_SECRET") or read_env().get("APP_CSRF_SECRET", "")
+    if secret:
+        return secret
+    secret = secrets.token_urlsafe(32)
+    os.environ["APP_CSRF_SECRET"] = secret
+    try:
+        write_env({"APP_CSRF_SECRET": secret})
+    except Exception as exc:
+        logger.warning("Could not persist APP_CSRF_SECRET; using process-local token: %s", exc)
+    return secret
+
+
+def csrf_token(username: str | None = None) -> str:
+    subject = username or current_username() or "anonymous"
+    return hmac.new(csrf_secret().encode(), subject.encode(), hashlib.sha256).hexdigest()
+
+
+def csrf_input() -> str:
+    return f"<input type='hidden' name='_csrf' value='{escape(csrf_token())}'>"
+
+
+def valid_csrf_token(token: str | None) -> bool:
+    return bool(token) and hmac.compare_digest(str(token), csrf_token())
+
+
+def login_attempt_key(username: str | None = None) -> str:
+    remote = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",", 1)[0].strip()
+    return f"{remote}:{username or ''}"
+
+
+def login_blocked(username: str | None) -> bool:
+    key = login_attempt_key(username)
+    cutoff = time.monotonic() - LOGIN_WINDOW_SECONDS
+    with failed_login_lock:
+        attempts = [value for value in failed_login_attempts.get(key, []) if value >= cutoff]
+        failed_login_attempts[key] = attempts
+        return len(attempts) >= MAX_FAILED_LOGINS
+
+
+def record_login_failure(username: str | None) -> None:
+    key = login_attempt_key(username)
+    cutoff = time.monotonic() - LOGIN_WINDOW_SECONDS
+    with failed_login_lock:
+        attempts = [value for value in failed_login_attempts.get(key, []) if value >= cutoff]
+        attempts.append(time.monotonic())
+        failed_login_attempts[key] = attempts
+
+
+def clear_login_failures(username: str | None) -> None:
+    with failed_login_lock:
+        failed_login_attempts.pop(login_attempt_key(username), None)
+
+
+def _production_warnings_uncached(env: dict[str, str]) -> list[str]:
+    warnings: list[str] = []
+    gemini_key = env.get("GEMINI_API_KEY", "").strip()
+    if not gemini_key or gemini_key == "your_key_here":
+        warnings.append("Gemini API key is missing.")
+    try:
+        if not auth_enabled():
+            warnings.append("Login is off. Add APP_USERNAME and APP_PASSWORD, then restart once to create an admin user.")
+    except Exception as exc:
+        warnings.append(f"Could not verify login setup: {exc}")
+    if truthy_env("ALLOW_AUTH_BYPASS"):
+        warnings.append("Authentication bypass is enabled. Disable ALLOW_AUTH_BYPASS before production use.")
+    if env.get("TEST_MAX_PAGES", "0").strip() != "0":
+        warnings.append("Page limit is enabled. Set TEST_MAX_PAGES=0 for full production books.")
+    try:
+        disk = shutil.disk_usage(ROOT)
+        free_mb = disk.free // (1024 * 1024)
+        reserve_mb = int(env.get("MIN_FREE_DISK_MB", str(MIN_FREE_DISK_MB)))
+        if free_mb < reserve_mb:
+            warnings.append(f"Low disk space: {free_mb} MB free, reserve is {reserve_mb} MB.")
+    except Exception as exc:
+        warnings.append(f"Could not check disk space: {exc}")
+    poppler_path = env.get("POPPLER_PATH", "").strip().strip('"')
+    if poppler_path and not Path(poppler_path).exists():
+        warnings.append(f"POPPLER_PATH does not exist: {poppler_path}")
+    try:
+        page_workers = int(env.get("PAGE_WORKERS_PER_JOB", "2"))
+        parallel_jobs = int(env.get("MAX_PARALLEL_JOBS", "2"))
+        if page_workers * parallel_jobs > 6:
+            warnings.append("Parallelism is high. Keep MAX_PARALLEL_JOBS x PAGE_WORKERS_PER_JOB at 6 or less until quota is proven.")
+    except ValueError:
+        warnings.append("Parallel job settings are not valid integers.")
+    try:
+        web_concurrency = int(os.getenv("WEB_CONCURRENCY", env.get("WEB_CONCURRENCY", "1")))
+        if web_concurrency > 1:
+            warnings.append("Multiple web workers are not supported with the local SQLite/file queue. Run one web process for production.")
+    except ValueError:
+        warnings.append("WEB_CONCURRENCY is not a valid integer.")
+    return warnings
+
+
+def production_warnings(env: dict[str, str] | None = None) -> list[str]:
+    env = env or read_env()
+    signature = tuple(sorted(env.items())) + (("WEB_CONCURRENCY", os.getenv("WEB_CONCURRENCY", "")),)
+    now_monotonic = time.monotonic()
+    with production_warnings_lock:
+        if (
+            production_warnings_cache["signature"] == signature
+            and float(production_warnings_cache["expires_at"]) > now_monotonic
+        ):
+            return list(production_warnings_cache["warnings"])
+
+    warnings = _production_warnings_uncached(env)
+    with production_warnings_lock:
+        production_warnings_cache.update(
+            {
+                "signature": signature,
+                "expires_at": now_monotonic + PRODUCTION_WARNING_CACHE_SECONDS,
+                "warnings": list(warnings),
+            }
+        )
+    return warnings
+
+
 def auth_enabled() -> bool:
     ensure_project_files()
     with sqlite3.connect(JOBS_DB) as con:
         count = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         return count > 0
+
+
+def auth_bypass_active() -> bool:
+    return truthy_env("ALLOW_AUTH_BYPASS") and not auth_enabled()
 
 
 def current_username() -> str | None:
@@ -390,24 +627,75 @@ def is_current_admin() -> bool:
         return bool(row and row[0])
 
 
+def user_can_access_job(job: dict[str, Any] | None, username: str | None = None) -> bool:
+    if not job:
+        return False
+    if auth_bypass_active():
+        return True
+    if is_current_admin():
+        return True
+    username = username if username is not None else current_username()
+    return bool(username) and job.get("uploaded_by") == username
+
+
+def user_can_access_job_id(job_id: str) -> bool:
+    if not valid_job_id(job_id):
+        return False
+    return user_can_access_job(job_by_id(job_id))
+
+
+def visible_jobs_for_current_user(jobs: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    jobs = jobs if jobs is not None else load_jobs()
+    if auth_bypass_active():
+        return jobs
+    if is_current_admin():
+        return jobs
+    username = current_username()
+    return [job for job in jobs if username and job.get("uploaded_by") == username]
+
+
+def completed_doc_owner_job_id(filename: str) -> str | None:
+    match = COMPLETED_DOC_JOB_RE.match(Path(filename).name)
+    return match.group("job_id") if match else None
+
+
+def user_can_access_completed_doc(path: Path) -> bool:
+    if auth_bypass_active():
+        return True
+    if is_current_admin():
+        return True
+    job_id = completed_doc_owner_job_id(path.name)
+    return bool(job_id and user_can_access_job_id(job_id))
+
+
+def visible_completed_doc_files() -> list[Path]:
+    return [path for path in completed_doc_files() if user_can_access_completed_doc(path)]
+
+
 def authorized() -> bool:
     if not auth_enabled():
-        return True
+        return truthy_env("ALLOW_AUTH_BYPASS")
     auth = request.authorization
     if not auth or not auth.username or not auth.password:
+        return False
+    if login_blocked(auth.username):
         return False
     with sqlite3.connect(JOBS_DB) as con:
         con.row_factory = sqlite3.Row
         user = con.execute("SELECT password_hash FROM users WHERE username = ?", (auth.username,)).fetchone()
         if not user:
+            record_login_failure(auth.username)
             return False
         import bcrypt
         ok = bcrypt.checkpw(auth.password.encode(), user["password_hash"].encode())
     if ok:
+        clear_login_failures(auth.username)
         with jobs_lock:
             with jobs_file_lock():
                 with sqlite3.connect(JOBS_DB) as con:
                     con.execute("UPDATE users SET last_login_at = ? WHERE username = ?", (now_text(), auth.username))
+    else:
+        record_login_failure(auth.username)
     return ok
 
 
@@ -424,11 +712,21 @@ def require_auth() -> Response | None:
     )
 
 
+@app.before_request
+def require_csrf() -> Response | None:
+    if request.endpoint == "health" or request.method in {"GET", "HEAD", "OPTIONS"}:
+        return None
+    token = request.form.get("_csrf") or request.headers.get("X-CSRF-Token")
+    if valid_csrf_token(token):
+        return None
+    return Response("Forbidden: invalid CSRF token", status=403)
+
+
 @app.route("/admin", methods=["GET"])
 def admin_dashboard() -> Response | str:
     if not is_current_admin():
         return Response("Forbidden: Admin access required", status=403)
-    jobs = load_jobs()
+    jobs = visible_jobs_for_current_user()
     counts = {status: sum(1 for job in jobs if job.get("status") == status) for status in ["queued", "running", "completed", "completed_with_review_needed", "failed"]}
     disk = shutil.disk_usage(ROOT)
     with sqlite3.connect(JOBS_DB) as con:
@@ -483,12 +781,13 @@ def admin_users() -> Response | str:
         admin_str = "Yes" if u["is_admin"] else "No"
         delete_btn = ""
         if u["username"] != auth.username:
-            delete_btn = f"<form action='/admin/users/{u['username']}/delete' method='post' style='display:inline;'><button type='submit'>Delete</button></form>"
+            delete_btn = f"<form action='{url_for('admin_users_delete', username=u['username'])}' method='post' style='display:inline;'>{csrf_input()}<button type='submit'>Delete</button></form>"
         html.append(f"<tr><td>{escape(u['username'])}</td><td>{admin_str}</td><td>{escape(u['created_at'])}</td><td>{escape(str(u['last_login_at'] or ''))}</td><td>{delete_btn}</td></tr>")
     html.append("</table>")
     
     html.append("<h2>Add User</h2>")
     html.append("<form action='/admin/users/add' method='post'>")
+    html.append(csrf_input())
     html.append("Username: <input type='text' name='username' required><br>")
     html.append("Password: <input type='password' name='password' required><br>")
     html.append("Admin: <input type='checkbox' name='is_admin' value='1'><br>")
@@ -507,7 +806,7 @@ def admin_users_add() -> Response:
     password = request.form.get("password", "").strip()
     is_admin = 1 if request.form.get("is_admin") == "1" else 0
     
-    if username and password:
+    if username and password and USERNAME_RE.fullmatch(username):
         import bcrypt
         pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
         with jobs_lock:
@@ -544,6 +843,10 @@ def add_production_headers(response: Response) -> Response:
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("Cache-Control", "no-store")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+    )
     return response
 
 
@@ -708,7 +1011,7 @@ def ensure_disk_space(required_bytes: int | None = None) -> None:
     ensure_project_files()
     free_bytes = shutil.disk_usage(JOBS_DIR).free
     upload_bytes = max(0, int(required_bytes or 0))
-    reserve_bytes = int(os.getenv("MIN_FREE_DISK_MB", str(MIN_FREE_DISK_MB))) * 1024 * 1024
+    reserve_bytes = parse_int_value(os.getenv("MIN_FREE_DISK_MB"), MIN_FREE_DISK_MB, 0, None) * 1024 * 1024
     if free_bytes < upload_bytes + reserve_bytes:
         free_mb = free_bytes // (1024 * 1024)
         reserve_mb = reserve_bytes // (1024 * 1024)
@@ -726,23 +1029,7 @@ def create_job(pdf_file: Any, uploaded_by: str | None = None) -> str:
     target_path = ensure_child_path(pdf_dir, pdf_dir / filename)
     pdf_file.save(target_path)
 
-    job_env = env.copy()
-    job_env.update(
-        {
-            "PDF_DIR": "./pdfs",
-            "OUTPUT_DIR": "./output_notes",
-            "CREATE_DOCX": "true",
-            "RESET_MASTER": "false",
-            "TEST_START_PAGE": env.get("TEST_START_PAGE", "1"),
-            "TEST_MAX_PAGES": env.get("TEST_MAX_PAGES", "0"),
-            "TEST_PDF_LIMIT": "1",
-            "CREATE_STRUCTURED_NOTES": env.get("CREATE_STRUCTURED_NOTES", "false"),
-            "SPEED_MODE": env.get("SPEED_MODE", "balanced"),
-            "PAGE_WORKERS_PER_JOB": env.get("PAGE_WORKERS_PER_JOB", "2"),
-        }
-    )
-    env_lines = [f"{key}={value}" for key, value in job_env.items()]
-    (folder / ".env").write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+    write_job_env(folder, build_job_env(env))
 
     job = {
         "id": job_id,
@@ -1001,7 +1288,7 @@ def render_slide_deck_panel(job_id: str, display_status: str) -> str:
             parts.append("<button class='secondary' disabled>Generating Slide Deck...</button>")
         else:
             label = "Retry Slide Deck Generation" if deck_status == "failed" else "Generate Ayurveda Slide Deck"
-            parts.append(f"<form action='{url_for('generate_image_slide_deck_route', job_id=job_id)}' method='post'><button class='secondary'>{label}</button></form>")
+            parts.append(f"<form action='{url_for('generate_image_slide_deck_route', job_id=job_id)}' method='post'>{csrf_input()}<button class='secondary'>{label}</button></form>")
         deck_done = deck_status in {"completed", "completed_with_review_needed"}
         if deck_done and slide_deck_zip_file(job_id).exists():
             parts.append(f"<a class='button secondary' href='{url_for('download_image_slide_deck', job_id=job_id)}'>Download Ayurveda Slide Deck</a>")
@@ -1073,13 +1360,6 @@ def load_slide_deck_state(job_id: str) -> dict[str, Any]:
     return default
 
 
-def job_by_id(job_id: str) -> dict[str, Any] | None:
-    for job in load_jobs():
-        if job.get("id") == job_id:
-            return job
-    return None
-
-
 def summarize_failure(job_id: str) -> str:
     text = job_log(job_id, max_chars=12000)
     for line in reversed(text.splitlines()):
@@ -1116,10 +1396,23 @@ def run_job(job: dict[str, Any]) -> None:
         running_job_ids.add(job_id)
     try:
         folder = job_dir(job_id)
+        root_env = read_env()
+        if not refresh_job_env(job_id, root_env):
+            update_job(
+                job_id,
+                status="failed",
+                finished_at=now_text(),
+                return_code=None,
+                failure_reason="Job folder is missing or damaged. Upload the PDF again.",
+            )
+            return
         log_dir = folder / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "interface_run.log"
         env = os.environ.copy()
+        for key in [*PROCESSOR_SECRET_ENV_KEYS, *WEB_ONLY_ENV_KEYS]:
+            env.pop(key, None)
+        env.update(build_processor_runtime_env(root_env))
         env["PYTHONIOENCODING"] = "utf-8"
 
         update_job(job_id, status="running", started_at=now_text())
@@ -1254,7 +1547,10 @@ def reset_job(job_id: str) -> bool:
         return False
     job = job_by_id(job_id)
     if job and job.get("status") in {"failed", "completed", "completed_with_review_needed"}:
-        update_job(job_id, status="queued", return_code=None)
+        if not refresh_job_env(job_id):
+            update_job(job_id, failure_reason="Job folder is missing or damaged. Upload the PDF again.")
+            return False
+        update_job(job_id, status="queued", return_code=None, failure_reason="")
         return True
     return False
 
@@ -1282,7 +1578,8 @@ def delete_job(job_id: str) -> tuple[bool, str]:
 
 
 def page_text_file(job_id: str, folder_name: str, pdf_stem: str, page_number: int, suffix: str) -> Path:
-    return job_dir(job_id) / folder_name / pdf_stem / f"page_{page_number:03d}_{suffix}.md"
+    base = job_dir(job_id) / folder_name / Path(pdf_stem).name
+    return ensure_child_path(job_dir(job_id), base / f"page_{page_number:03d}_{suffix}.md")
 
 
 def first_pdf_stem_for_page(job_id: str, page_number: int) -> str:
@@ -1309,10 +1606,13 @@ def render_page() -> str:
     inline_workers = "Inline" if inline_workers_enabled() else "Separate"
     test_start_page = env.get("TEST_START_PAGE", "1")
     test_max_pages = env.get("TEST_MAX_PAGES", "0")
-    jobs = load_jobs()
+    jobs = visible_jobs_for_current_user()
     running_count = sum(1 for job in jobs if job.get("status") == "running")
     queued_count = sum(1 for job in jobs if job.get("status") == "queued")
-    completed_docs = completed_doc_files()
+    failed_count = sum(1 for job in jobs if job.get("status") == "failed")
+    review_count = sum(1 for job in jobs if failed_page_count(job["id"]))
+    completed_count = sum(1 for job in jobs if job.get("status") in {"completed", "completed_with_review_needed"})
+    completed_docs = visible_completed_doc_files()
     disk = shutil.disk_usage(ROOT)
     free_disk_mb = disk.free // (1024 * 1024)
     admin_link_html = "<a class='button secondary' href='/admin'>Admin</a>" if is_current_admin() else ""
@@ -1337,9 +1637,9 @@ def render_page() -> str:
         if failed_page_count(job["id"]):
             actions += f"<a class='button secondary' href='{url_for('review_pages', job_id=job['id'])}'>Review Failed Pages</a>"
         if job.get("status") in {"failed", "completed"}:
-            actions += f"<form action='{url_for('retry_job', job_id=job['id'])}' method='post'><button class='secondary'>Run Again / Resume</button></form>"
+            actions += f"<form action='{url_for('retry_job', job_id=job['id'])}' method='post'>{csrf_input()}<button class='secondary'>Run Again / Resume</button></form>"
         if job.get("status") != "running":
-            actions += f"<form action='{url_for('remove_job', job_id=job['id'])}' method='post'><button class='danger'>Delete</button></form>"
+            actions += f"<form action='{url_for('remove_job', job_id=job['id'])}' method='post'>{csrf_input()}<button class='danger'>Delete</button></form>"
         status_class = f"status {display_status}"
         failure = f"<small class='problem'>{escape(job.get('failure_reason', ''))}</small>" if job.get("failure_reason") else ""
         job_items.append(
@@ -1360,6 +1660,31 @@ def render_page() -> str:
         notice_html = f"<div class='notice success'>{escape(upload_message)} PDF file(s) uploaded and queued for processing.</div>"
     elif error_message:
         notice_html = f"<div class='notice error'>{escape(error_message)}</div>"
+    warnings = production_warnings(env)
+    warning_html = ""
+    if warnings:
+        warning_items = "".join(f"<li>{escape(item)}</li>" for item in warnings)
+        warning_html = f"<div class='notice warning'><strong>Production checks need attention</strong><ul>{warning_items}</ul></div>"
+    health_label = "Attention" if warnings else ("Processing" if running_count else ("Queued" if queued_count else "Ready"))
+    health_class = "warn" if warnings else ("active" if running_count else "ok")
+    overview_html = f"""
+    <section class="overview">
+      <div class="section-head">
+        <div>
+          <h2>Executive Overview</h2>
+          <small>Production queue, output readiness, and review workload.</small>
+        </div>
+        <span class="health-badge {health_class}">{health_label}</span>
+      </div>
+      <div class="kpis">
+        <div class="kpi active"><small>Running</small><strong>{running_count}</strong></div>
+        <div class="kpi"><small>Queued</small><strong>{queued_count}</strong></div>
+        <div class="kpi ok"><small>Word Files</small><strong>{len(completed_docs)}</strong></div>
+        <div class="kpi warn"><small>Review Needed</small><strong>{review_count}</strong></div>
+        <div class="kpi bad"><small>Failed</small><strong>{failed_count}</strong></div>
+      </div>
+    </section>
+    """
 
     _deck_cache: dict[str, dict[str, Any]] = {}
     for job in jobs:
@@ -1376,9 +1701,9 @@ def render_page() -> str:
   <style>
     :root {{
       color-scheme: light;
-      --bg: #f5f6f8; --panel: #fff; --panel-2: #fbfdff; --text: #1f2933; --muted: #697586;
-      --line: #d9dee5; --accent: #0f766e; --accent-dark: #115e59; --bad: #b42318; --soft: #e8f3f1; --blue: #175cd3;
-      --field: #fff; --shadow: rgba(16, 24, 40, .04); --pre-bg: #101828; --pre-text: #e6edf3;
+      --bg: #f4f6f8; --panel: #fff; --panel-2: #fbfdff; --text: #182230; --muted: #667085;
+      --line: #d7dde5; --accent: #0f766e; --accent-dark: #115e59; --bad: #b42318; --soft: #e8f3f1; --blue: #175cd3;
+      --field: #fff; --shadow: rgba(16, 24, 40, .06); --pre-bg: #101828; --pre-text: #e6edf3;
     }}
     [data-theme="dark"] {{
       color-scheme: dark;
@@ -1388,11 +1713,14 @@ def render_page() -> str:
     }}
     * {{ box-sizing: border-box; }}
     body {{ margin: 0; background: var(--bg); color: var(--text); font-family: Segoe UI, Arial, sans-serif; font-size: 15px; }}
-    header {{ background: var(--panel); border-bottom: 1px solid var(--line); padding: 18px 28px; display: flex; justify-content: space-between; gap: 18px; align-items: center; }}
-    h1 {{ margin: 0; font-size: 22px; }}
+    header.appbar {{ background: var(--panel); border-bottom: 1px solid var(--line); padding: 20px 28px 18px; display: grid; grid-template-columns: 1fr auto; gap: 14px 20px; align-items: start; box-shadow: 0 1px 2px var(--shadow); }}
+    h1 {{ margin: 2px 0 0; font-size: 24px; font-weight: 760; }}
+    .eyebrow {{ color: var(--accent-dark); text-transform: uppercase; font-size: 12px; font-weight: 800; letter-spacing: 0; }}
     main {{ max-width: 1180px; margin: 0 auto; padding: 24px; display: grid; gap: 18px; }}
     .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }}
     section {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; box-shadow: 0 1px 2px var(--shadow); }}
+    .overview {{ padding: 20px; }}
+    .section-head {{ display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 16px; }}
     h2 {{ margin: 0 0 14px; font-size: 17px; }}
     label {{ display: block; margin: 12px 0 6px; color: var(--muted); font-size: 13px; }}
     input[type=file], input[type=number], select {{ width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: var(--field); color: var(--text); }}
@@ -1405,11 +1733,31 @@ def render_page() -> str:
     .actions {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }}
     .actions.inline {{ margin-top: 0; justify-content: flex-end; }}
     .statusbar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }}
+    .headerstatus {{ grid-column: 1 / -1; }}
     .pill {{ border: 1px solid var(--line); background: var(--panel); padding: 8px 10px; border-radius: 999px; color: var(--muted); font-size: 13px; }}
     .pill.ready {{ background: var(--soft); border-color: #b7ddd6; }}
+    .health-badge {{ border-radius: 999px; padding: 7px 12px; font-size: 12px; font-weight: 800; border: 1px solid var(--line); }}
+    .health-badge.ok {{ color: #067647; background: #ecfdf3; border-color: #abefc6; }}
+    .health-badge.active {{ color: #175cd3; background: #eff8ff; border-color: #b2ddff; }}
+    .health-badge.warn {{ color: #c4320a; background: #fff6ed; border-color: #fedf89; }}
+    .kpis {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; }}
+    .kpi {{ border: 1px solid var(--line); background: var(--panel-2); border-radius: 8px; padding: 14px; min-height: 92px; display: flex; flex-direction: column; justify-content: space-between; }}
+    .kpi strong {{ display: block; font-size: 30px; line-height: 1; margin-top: 10px; }}
+    .kpi small {{ text-transform: uppercase; font-size: 12px; font-weight: 760; color: var(--muted); }}
+    .kpi.active {{ border-color: #b2ddff; background: #eff8ff; }}
+    .kpi.ok {{ border-color: #abefc6; background: #ecfdf3; }}
+    .kpi.warn {{ border-color: #fedf89; background: #fff6ed; }}
+    .kpi.bad {{ border-color: #fecdca; background: #fef3f2; }}
+    [data-theme="dark"] .kpi.active {{ border-color: #1d4ed8; background: #12213a; }}
+    [data-theme="dark"] .kpi.ok {{ border-color: #047857; background: #0f2f27; }}
+    [data-theme="dark"] .kpi.warn {{ border-color: #92400e; background: #332313; }}
+    [data-theme="dark"] .kpi.bad {{ border-color: #991b1b; background: #351b1b; }}
     .notice {{ border-radius: 8px; padding: 12px 14px; border: 1px solid var(--line); background: #fff; }}
     .notice.success {{ background: #ecfdf3; border-color: #abefc6; color: #067647; }}
     .notice.error {{ background: #fef3f2; border-color: #fecdca; color: var(--bad); }}
+    .notice.warning {{ background: #fff6ed; border-color: #fedf89; color: #9c5b00; }}
+    .notice.warning ul {{ display: block; margin: 8px 0 0 18px; padding: 0; list-style: disc; }}
+    .notice.warning li {{ display: list-item; border: 0; padding: 0; min-height: 0; }}
     .progressbox {{ border: 1px solid #b7ddd6; background: #f0fdfa; border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; gap: 12px; align-items: center; }}
     .progressbox.idle {{ border-color: var(--line); background: var(--panel); }}
     .jobmeta, .deckbox {{ margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }}
@@ -1441,20 +1789,22 @@ def render_page() -> str:
     .wide {{ grid-column: 1 / -1; }}
     .note {{ color: var(--muted); margin-top: 8px; }}
     .top-actions {{ display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }}
-    @media (max-width: 760px) {{ header {{ flex-direction: column; align-items: flex-start; }} main {{ padding: 14px; }} .grid, .steps {{ grid-template-columns: 1fr; }} li {{ grid-template-columns: 1fr; }} .actions.inline, .top-actions {{ justify-content: flex-start; }} .button, button {{ width: 100%; }} .statusbar {{ width: 100%; }} }}
+    @media (max-width: 900px) {{ .kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+    @media (max-width: 760px) {{ header.appbar {{ grid-template-columns: 1fr; padding: 18px; }} main {{ padding: 14px; }} .grid, .steps, .kpis {{ grid-template-columns: 1fr; }} li {{ grid-template-columns: 1fr; }} .actions.inline, .top-actions {{ justify-content: flex-start; }} .button, button {{ width: 100%; }} .statusbar {{ width: 100%; }} }}
   </style>
 </head>
 <body data-theme="light">
-  <header>
+  <header class="appbar">
     <div>
+      <div class="eyebrow">Production Dashboard</div>
       <h1>Ayurvedic Book Processor</h1>
-      <div class="note">Gemini multimodal transcription + verification | parallel DOCX jobs</div>
+      <div class="note">Gemini transcription, verification, and Word output queue</div>
     </div>
     <div class="top-actions">
       {admin_link_html}
       <button id="themeToggle" class="secondary" type="button">Dark Mode</button>
     </div>
-    <div class="statusbar">
+    <div class="statusbar headerstatus">
       <span class="pill ready">Mode: <strong>{'Full PDF' if test_max_pages == '0' else escape(test_max_pages) + ' pages'}</strong></span>
       <span class="pill">Structured notes: <strong>{structured_text}</strong></span>
       <span class="pill ready">Speed: <strong>{speed_mode.title()}</strong></span>
@@ -1470,14 +1820,8 @@ def render_page() -> str:
   </header>
   <main>
     {notice_html}
-    <section>
-      <h2>Workflow</h2>
-      <div class="steps">
-        <div class="step"><b>1. Upload PDF</b><small>Scanned books or chapters only.</small></div>
-        <div class="step"><b>2. Automatic processing</b><small>Up to {max_parallel_jobs()} jobs run together.</small></div>
-        <div class="step"><b>3. Download DOCX</b><small>Final Word files appear below.</small></div>
-      </div>
-    </section>
+    {warning_html}
+    {overview_html}
     <section>
       <h2>Live Progress</h2>
       <div id="progressBox" class="progressbox {'idle' if running_count == 0 and queued_count == 0 else ''}">
@@ -1492,6 +1836,7 @@ def render_page() -> str:
       <section>
         <h2>Upload PDFs</h2>
         <form id="uploadForm" action="/upload" method="post" enctype="multipart/form-data">
+          {csrf_input()}
           <label>Select scanned PDF files</label>
           <input id="pdfInput" type="file" name="pdfs" accept="application/pdf,.pdf" multiple>
           <div class="actions"><button id="uploadButton" type="submit">Upload and Start</button><a class="button secondary" href="/">Refresh Status</a></div>
@@ -1501,6 +1846,7 @@ def render_page() -> str:
       <section>
         <h2>Processing Settings</h2>
         <form action="/settings" method="post">
+          {csrf_input()}
           <div class="note">Use a page limit for tests only. If a long PDF fails near the end, Run Again / Resume reuses saved verified pages.</div>
           <label>Structured Nidan Panchak notes</label>
           <select name="structured">
@@ -1689,6 +2035,8 @@ def upload() -> Response:
 
 @app.post("/settings")
 def settings() -> Response:
+    if not is_current_admin():
+        return Response("Forbidden: Admin access required", status=403)
     structured = request.form.get("structured", "false")
     parallel = request.form.get("parallel", "3")
     speed_mode = request.form.get("speed_mode", "balanced")
@@ -1716,12 +2064,17 @@ def settings() -> Response:
 
 @app.post("/retry/<job_id>")
 def retry_job(job_id: str) -> Response:
-    reset_job(job_id)
-    return redirect(url_for("index"))
+    if not user_can_access_job_id(job_id):
+        return Response("Job not found", status=404)
+    if reset_job(job_id):
+        return redirect(url_for("index"))
+    return redirect(url_for("index", error="Could not queue that job again. The job folder may be missing or damaged."))
 
 
 @app.post("/delete/<job_id>")
 def remove_job(job_id: str) -> Response:
+    if not user_can_access_job_id(job_id):
+        return Response("Job not found", status=404)
     deleted, message = delete_job(job_id)
     key = "deck" if deleted else "error"
     return redirect(url_for("index", **{key: message}))
@@ -1729,7 +2082,7 @@ def remove_job(job_id: str) -> Response:
 
 @app.get("/jobs/<job_id>/review-pages")
 def review_pages(job_id: str) -> Response:
-    if not valid_job_id(job_id):
+    if not user_can_access_job_id(job_id):
         return Response("Job not found", status=404)
     state = load_job_state(job_id)
     failed_rows = flatten_page_map(state.get("failed_pages", {}))
@@ -1744,8 +2097,8 @@ def review_pages(job_id: str) -> Response:
         rows.append(
             f"<section><h2>Page {page_number}</h2>"
             f"<p><b>PDF:</b> {escape(pdf_stem)}<br><b>Stage:</b> {escape(str(row.get('stage', 'page_processing')))}<br><b>Error:</b> {escape(friendly_error(str(row.get('error', ''))))}<br><b>Retry count:</b> {escape(str(retry_count))}<br><b>Status:</b> needs review</p>"
-            f"<form action='{url_for('retry_page', job_id=job_id, page_number=page_number)}' method='post'><input type='hidden' name='pdf_stem' value='{escape(pdf_stem)}'><button>Retry Page</button></form>"
-            f"<form action='{url_for('save_page', job_id=job_id, page_number=page_number)}' method='post'><input type='hidden' name='pdf_stem' value='{escape(pdf_stem)}'><label>Manual correction</label><textarea name='corrected_text' rows='10'>{escape(verified or extracted)}</textarea><button>Save Manual Correction</button></form>"
+            f"<form action='{url_for('retry_page', job_id=job_id, page_number=page_number)}' method='post'>{csrf_input()}<input type='hidden' name='pdf_stem' value='{escape(pdf_stem)}'><button>Retry Page</button></form>"
+            f"<form action='{url_for('save_page', job_id=job_id, page_number=page_number)}' method='post'>{csrf_input()}<input type='hidden' name='pdf_stem' value='{escape(pdf_stem)}'><label>Manual correction</label><textarea name='corrected_text' rows='10'>{escape(verified or extracted)}</textarea><button>Save Manual Correction</button></form>"
             f"<details><summary>Extracted text</summary><pre>{escape(extracted)}</pre></details><details><summary>Verified text</summary><pre>{escape(verified)}</pre></details></section>"
         )
     body = "".join(rows) or "<p>No failed pages are currently recorded for this job.</p>"
@@ -1753,32 +2106,36 @@ def review_pages(job_id: str) -> Response:
         f"""<!doctype html><html><head><meta charset='utf-8'><title>Review Failed Pages</title>
         <style>body{{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1f2933}}section{{border:1px solid #ddd;border-radius:8px;padding:14px;margin:12px 0}}textarea{{width:100%;font-family:Consolas,monospace}}pre{{white-space:pre-wrap;background:#f6f8fa;padding:12px}}.button,button{{padding:10px 14px;border:0;border-radius:6px;background:#0f766e;color:white;text-decoration:none;display:inline-block;margin:4px}}</style></head><body>
         <h1>Review Failed Pages</h1><p><a class='button' href='/'>Back</a></p>
-        <form action='{url_for('retry_failed_pages', job_id=job_id)}' method='post'><button>Retry Failed Pages</button></form>
-        <form action='{url_for('regenerate_docx', job_id=job_id)}' method='post'><button>Regenerate DOCX</button></form>{body}</body></html>""",
+        <form action='{url_for('retry_failed_pages', job_id=job_id)}' method='post'>{csrf_input()}<button>Retry Failed Pages</button></form>
+        <form action='{url_for('regenerate_docx', job_id=job_id)}' method='post'>{csrf_input()}<button>Regenerate DOCX</button></form>{body}</body></html>""",
         mimetype="text/html",
     )
 
 
 @app.post("/jobs/<job_id>/retry-page/<int:page_number>")
 def retry_page(job_id: str, page_number: int) -> Response:
+    if not user_can_access_job_id(job_id):
+        return Response("Job not found", status=404)
     reset_job(job_id)
     return redirect(url_for("review_pages", job_id=job_id))
 
 
 @app.post("/jobs/<job_id>/retry-failed-pages")
 def retry_failed_pages(job_id: str) -> Response:
+    if not user_can_access_job_id(job_id):
+        return Response("Job not found", status=404)
     reset_job(job_id)
     return redirect(url_for("index", deck="Failed pages queued for retry."))
 
 
 @app.post("/jobs/<job_id>/save-page/<int:page_number>")
 def save_page(job_id: str, page_number: int) -> Response:
-    if not valid_job_id(job_id):
+    if not user_can_access_job_id(job_id):
         return Response("Job not found", status=404)
     corrected = request.form.get("corrected_text", "").strip()
     if not corrected:
         return redirect(url_for("review_pages", job_id=job_id, error="Correction text is empty."))
-    pdf_stem = request.form.get("pdf_stem") or first_pdf_stem_for_page(job_id, page_number)
+    pdf_stem = Path(request.form.get("pdf_stem") or first_pdf_stem_for_page(job_id, page_number)).name
     target = page_text_file(job_id, "verified_pages", pdf_stem, page_number, "verified")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(corrected + "\n", encoding="utf-8")
@@ -1800,13 +2157,15 @@ def save_page(job_id: str, page_number: int) -> Response:
 
 @app.post("/jobs/<job_id>/regenerate-docx")
 def regenerate_docx(job_id: str) -> Response:
+    if not user_can_access_job_id(job_id):
+        return Response("Job not found", status=404)
     reset_job(job_id)
     return redirect(url_for("index", deck="DOCX regeneration queued."))
 
 
 @app.post("/jobs/<job_id>/generate-image-slide-deck")
 def generate_image_slide_deck_route(job_id: str) -> Response:
-    if not valid_job_id(job_id):
+    if not user_can_access_job_id(job_id):
         return redirect(url_for("index", error="Slide deck could not be generated because the job was not found."))
     job = job_by_id(job_id)
     if not job:
@@ -1823,7 +2182,8 @@ def generate_image_slide_deck_route(job_id: str) -> Response:
 
 def status_payload() -> dict[str, Any]:
     jobs = []
-    for job in load_jobs():
+    env = read_env()
+    for job in visible_jobs_for_current_user():
         item = job.copy()
         if item.get("status") == "completed" and job_output_files(item["id"]) and failed_page_count(item["id"]):
             item["status"] = "completed_with_review_needed"
@@ -1842,6 +2202,7 @@ def status_payload() -> dict[str, Any]:
             "queued": sum(1 for job in jobs if job.get("status") == "queued"),
             "running": sum(1 for job in jobs if job.get("status") == "running"),
         },
+        "warnings": production_warnings(env),
     }
 
 
@@ -1852,28 +2213,40 @@ def status() -> Response:
 
 @app.get("/events")
 def events() -> Response:
+    global sse_connections
+    with sse_lock:
+        if sse_connections >= MAX_SSE_CONNECTIONS:
+            return Response("Too many live status connections", status=429)
+        sse_connections += 1
+
     @stream_with_context
     def generate() -> Iterator[str]:
-        last_payload = ""
-        while True:
-            payload = json.dumps(status_payload(), ensure_ascii=False)
-            if payload != last_payload:
-                yield f"event: status\ndata: {payload}\n\n"
-                last_payload = payload
-            time.sleep(3)
+        global sse_connections
+        try:
+            last_payload = ""
+            while True:
+                payload = json.dumps(status_payload(), ensure_ascii=False)
+                if payload != last_payload:
+                    yield f"event: status\ndata: {payload}\n\n"
+                    last_payload = payload
+                time.sleep(3)
+        finally:
+            with sse_lock:
+                sse_connections = max(0, sse_connections - 1)
 
     return Response(generate(), mimetype="text/event-stream")
 
 
 @app.get("/download/<job_id>/<path:filename>")
 def download_output(job_id: str, filename: str) -> Response:
-    if not valid_job_id(job_id):
+    if not user_can_access_job_id(job_id):
         return Response("File not found", status=404)
     completed_path = (COMPLETED_DOCS_DIR / Path(filename).name).resolve()
     if (
         COMPLETED_DOCS_DIR.resolve() in completed_path.parents
         and completed_path.suffix.lower() == ".docx"
         and completed_path.exists()
+        and user_can_access_completed_doc(completed_path)
     ):
         return send_file(completed_path, as_attachment=True)
     output_dir = (job_dir(job_id) / "output_notes").resolve()
@@ -1885,7 +2258,7 @@ def download_output(job_id: str, filename: str) -> Response:
 
 @app.get("/download-review-report/<job_id>")
 def download_review_report(job_id: str) -> Response:
-    if not valid_job_id(job_id):
+    if not user_can_access_job_id(job_id):
         return Response("File not found", status=404)
     path = review_report_file(job_id).resolve()
     if job_dir(job_id).resolve() not in path.parents or path.name != "review_report.md" or not path.exists():
@@ -1895,7 +2268,7 @@ def download_review_report(job_id: str) -> Response:
 
 @app.get("/jobs/<job_id>/download-image-slide-deck")
 def download_image_slide_deck(job_id: str) -> Response:
-    if not valid_job_id(job_id):
+    if not user_can_access_job_id(job_id):
         return Response("File not found", status=404)
     zip_root = SLIDE_DECK_OUTPUTS_DIR.resolve()
     path = slide_deck_zip_file(job_id).resolve()
@@ -1906,7 +2279,7 @@ def download_image_slide_deck(job_id: str) -> Response:
 
 @app.get("/jobs/<job_id>/download-slide-deck-review-report")
 def download_slide_deck_review_report(job_id: str) -> Response:
-    if not valid_job_id(job_id):
+    if not user_can_access_job_id(job_id):
         return Response("File not found", status=404)
     output_root = SLIDE_DECK_OUTPUTS_DIR.resolve()
     path = slide_deck_review_report_file(job_id).resolve()
@@ -1917,7 +2290,7 @@ def download_slide_deck_review_report(job_id: str) -> Response:
 
 @app.get("/jobs/<job_id>/download-slide-coverage-report")
 def download_slide_deck_coverage_report(job_id: str) -> Response:
-    if not valid_job_id(job_id):
+    if not user_can_access_job_id(job_id):
         return Response("File not found", status=404)
     output_root = SLIDE_DECK_OUTPUTS_DIR.resolve()
     path = slide_deck_coverage_report_file(job_id).resolve()
@@ -1928,7 +2301,7 @@ def download_slide_deck_coverage_report(job_id: str) -> Response:
 
 @app.get("/jobs/<job_id>/download-slide-prompt-used")
 def download_slide_deck_prompt_used(job_id: str) -> Response:
-    if not valid_job_id(job_id):
+    if not user_can_access_job_id(job_id):
         return Response("File not found", status=404)
     output_root = SLIDE_DECK_OUTPUTS_DIR.resolve()
     path = slide_deck_prompt_used_file(job_id).resolve()
@@ -1939,7 +2312,7 @@ def download_slide_deck_prompt_used(job_id: str) -> Response:
 
 @app.get("/jobs/<job_id>/review-slide-deck")
 def review_slide_deck(job_id: str) -> Response:
-    if not valid_job_id(job_id):
+    if not user_can_access_job_id(job_id):
         return Response("Job not found", status=404)
     state = load_slide_deck_state(job_id)
     output_dir = SLIDE_DECK_OUTPUTS_DIR / job_id
@@ -1956,7 +2329,7 @@ def review_slide_deck(job_id: str) -> Response:
         <style>body{{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1f2933}}.summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:14px 0}}.tile{{border:1px solid #ddd;border-radius:8px;padding:12px;background:#fff}}.tile small{{display:block;color:#697586;margin-top:4px}}pre{{white-space:pre-wrap;background:#f6f8fa;padding:12px;border:1px solid #ddd;border-radius:6px;max-height:520px;overflow:auto}}.button,button{{padding:10px 14px;border:0;border-radius:6px;background:#0f766e;color:white;text-decoration:none;display:inline-block;margin:4px}}.warn{{color:#c4320a;font-weight:700}}.ok{{color:#067647;font-weight:700}}</style></head><body>
         <h1>Ayurveda Slide Deck Review</h1>
         <p><a class='button' href='/'>Back</a></p>
-        <form action='{url_for('regenerate_slide_deck', job_id=job_id)}' method='post'><button>Regenerate Slide Deck</button></form>
+        <form action='{url_for('regenerate_slide_deck', job_id=job_id)}' method='post'>{csrf_input()}<button>Regenerate Slide Deck</button></form>
         <div class='summary'>
           <div class='tile'><b>Prompt Engine</b><small>{escape(friendly_prompt_engine_status(prompt_engine))}</small></div>
           <div class='tile'><b>Prompt Profile</b><small>{escape(prompt_profile or 'not recorded')}</small></div>
@@ -1976,13 +2349,20 @@ def review_slide_deck(job_id: str) -> Response:
 
 @app.post("/jobs/<job_id>/regenerate-slide-deck")
 def regenerate_slide_deck(job_id: str) -> Response:
+    if not user_can_access_job_id(job_id):
+        return Response("Job not found", status=404)
     return generate_image_slide_deck_route(job_id)
 
 
 @app.get("/download-doc/<path:filename>")
 def download_completed_doc(filename: str) -> Response:
     path = (COMPLETED_DOCS_DIR / Path(filename).name).resolve()
-    if COMPLETED_DOCS_DIR.resolve() not in path.parents or path.suffix.lower() != ".docx" or not path.exists():
+    if (
+        COMPLETED_DOCS_DIR.resolve() not in path.parents
+        or path.suffix.lower() != ".docx"
+        or not path.exists()
+        or not user_can_access_completed_doc(path)
+    ):
         return Response("File not found", status=404)
     return send_file(path, as_attachment=True)
 

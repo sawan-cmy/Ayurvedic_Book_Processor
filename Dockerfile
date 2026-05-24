@@ -16,6 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
+RUN useradd --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
 
 # Set production environment variables
 ENV HOST=0.0.0.0
@@ -24,6 +26,8 @@ ENV DISABLE_INLINE_WORKERS=false
 
 # Expose port
 EXPOSE 7860
+
+USER appuser
 
 # Command to run Waitress server with 50 threads for 25 concurrent users
 CMD ["waitress-serve", "--host=0.0.0.0", "--port=7860", "--threads=50", "app:app"]

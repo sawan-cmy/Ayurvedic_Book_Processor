@@ -8,7 +8,7 @@ services:
     ports:
       - "7860:7860"
     environment:
-      - MAX_PARALLEL_JOBS=25
+      - MAX_PARALLEL_JOBS=2
       - PAGE_WORKERS_PER_JOB=2
       - SPEED_MODE=balanced
     env_file:

@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from pdf2image import convert_from_path, pdfinfo_from_path
 from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPageCountError, PDFSyntaxError
 from PIL import Image
+from utils import clear_blocking_proxy_env
 
 try:
     from google import genai
@@ -226,7 +227,8 @@ def parse_float(value: str | None, default: float, minimum: float = 0.0) -> floa
 
 
 def load_config() -> Config:
-    load_dotenv()
+    load_dotenv(override=True)
+    clear_blocking_proxy_env()
     root_dir = Path.cwd()
     pdf_dir = Path(os.getenv("PDF_DIR", "./pdfs")).expanduser()
     output_dir = Path(os.getenv("OUTPUT_DIR", "./output_notes")).expanduser()

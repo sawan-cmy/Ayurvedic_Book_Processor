@@ -165,6 +165,23 @@ jobs/<job_id>/logs/interface_run.log
 jobs/<job_id>/logs/processor.log
 ```
 
+Run a fast local preflight before staff start uploading:
+
+```powershell
+.\.venv\Scripts\python.exe production_check.py
+```
+
+The web UI also shows production warnings for missing login, missing Gemini key,
+page-limit mode, low disk, invalid Poppler path, or risky parallelism.
+
+Per-job `.env` files contain only non-secret processor settings. `GEMINI_API_KEY`
+is passed to the processor process at runtime so it is not copied into every job
+folder.
+
+For local production/demo use, run one web process on one machine. The queue uses
+local SQLite plus local folders, so multiple web workers or multiple servers can
+process the same queue inconsistently.
+
 ## Backup
 
 Back up these regularly:
