@@ -40,3 +40,10 @@ CODE_EXPLANATION_FOR_COWORKERS.*
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Temporary cache and scratch files
+.pytest_cache/
+pytest-cache-files-*/
+image_deck_cache/
+scratch/
+
